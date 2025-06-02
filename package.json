@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "ts-node src/index.ts",
+    "fill": "ts-node src/index.ts",
+    "export": "ts-node src/query.ts",
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts"
   },
   "keywords": [],
@@ -20,6 +21,8 @@
     "bottleneck": "^2.19.5",
     "dotenv": "^16.5.0",
     "fs": "^0.0.1-security",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^5.1.7",
     "viem": "^2.30.4"
   }
 }

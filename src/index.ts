@@ -3,13 +3,15 @@ import { mainnet } from 'viem/chains';
 import dotenv from 'dotenv';
 import { writeFile } from 'fs/promises';
 import Bottleneck from 'bottleneck';
-
+import sqlite3 from 'sqlite3';
+import { open } from 'sqlite';
 dotenv.config();
 
 const ACCOUNT_ADDRESS = process.env.ACCOUNT_ADDRESS as `0x${string}`;
 const TOKEN_ADDRESS = process.env.TOKEN_ADDRESS as `0x${string}`;
 const NUMBER_OF_TRANSACTIONS = Number(process.env.NUMBER_OF_TRANSACTIONS);
 const ETH_RPC_URL = process.env.ETH_RPC_URL;
+const DB_PATH = process.env.DB_PATH || 'transfers.db';
 
 const OUTPUT_FILE = 'transfers';
 const ABI = 'event Transfer(address indexed from, address indexed to, uint256 value)';
@@ -30,6 +32,28 @@ const client = createPublicClient({
 	chain: mainnet,
 	transport: http(ETH_RPC_URL),
 })
+
+async function setupDatabase() {
+	const db = await open({
+		filename: DB_PATH,
+		driver: sqlite3.Database,
+	});
+
+	// save bigint as text and cast later
+	await db.exec(`
+		create table if not exists transfers (
+		tx_hash text primary key,
+		block_number text,
+		from_address text,
+		to_address text,
+		amount text,
+		gas_price text,
+		timestamp text
+		);
+	`)
+	return db;
+}
+
 
 async function fetchEvents(startBlock: bigint, endBlock: bigint) {
 	const logs = await limiter.schedule(() =>
@@ -106,7 +130,7 @@ function calculateGasStats(events: any[]) {
 	};
 }
 
-async function fetchAllEventsParallel(latestBlock: bigint, maxEvents: number) {
+async function fetchAllEvents(latestBlock: bigint, maxEvents: number) {
 	const events: any[] = [];
 	const ranges: Array<[bigint, bigint]> = [];
 
@@ -148,59 +172,84 @@ async function fetchAllEventsParallel(latestBlock: bigint, maxEvents: number) {
 }
 
 async function main() {
+	const db = await setupDatabase();
 	const latestBlock = await client.getBlockNumber();
-
-	const events = await fetchAllEventsParallel(latestBlock, NUMBER_OF_TRANSACTIONS);
-
+	const events = await fetchAllEvents(latestBlock, NUMBER_OF_TRANSACTIONS);
 	const enriched: any[] = [];
 
 	for (let i = 0; i < events.length; i += BATCH_SIZE) {
-	const batch = events.slice(i, i + BATCH_SIZE);
+		const batch = events.slice(i, i + BATCH_SIZE);
 
-	console.log(`Fetch gas price for batch ${i / BATCH_SIZE + 1} of ${Math.ceil(events.length / BATCH_SIZE)}...`);
+		console.log(`Fetch gas price for batch ${i / BATCH_SIZE + 1} of ${Math.ceil(events.length / BATCH_SIZE)}...`);
 
-	const results = await Promise.allSettled(
-		batch.map(async (e) => {
-			const [gasPrice, blockTimestamp] = await Promise.all([
-				(await client.getTransaction({ hash: e.transactionHash })).gasPrice ?? null,
-				(await client.getBlock({ blockNumber: e.blockNumber })).timestamp,
-			]);
+		const results = await Promise.allSettled(
+			batch.map(async (e) => {
+				const [transaction, block] = await Promise.all([
+					(limiter.schedule(() =>
+						client.getTransaction({ hash: e.transactionHash }))),
+					(limiter.schedule(() =>
+						client.getBlock({ blockNumber: e.blockNumber })
+					)),
+				]);
+				// ensure trnasaction and block always has values
+				if (!transaction || !block) {
+					console.warn(`Failed to fetch transaction or block for event: ${e.transactionHash}`);
+					return null;
+				}
 
-			return {
-				txHash: e.transactionHash,
-				blockNumber: e.blockNumber,
-				from: e.args.from,
-				to: e.args.to,
-				amount: e.args.value.toString(),
-				gasPrice: gasPrice,
-				timeStamp: new Date(Number(blockTimestamp) * 1000).toISOString(),
-				date: new Date(Number(blockTimestamp) * 1000).toISOString().split('T')[0],
-			};
-		})
-	);
+				return {
+					txHash: e.transactionHash,
+					blockNumber: e.blockNumber,
+					from: e.args.from,
+					to: e.args.to,
+					amount: e.args.value,
+					gasPrice: transaction.gasPrice,
+					timeStamp: new Date(Number(block.timestamp) * 1000).toISOString(),
+					date: new Date(Number(block.timestamp) * 1000).toISOString().split('T')[0],
+				};
+			})
+		);
 
-	for (const result of results) {
-		if (result.status === 'fulfilled') {
-		enriched.push(result.value);
+		for (const result of results) {
+			if (result.status === 'fulfilled') {
+			enriched.push(result.value);
+			}
 		}
 	}
+
+	try {
+		await db.exec(`BEGIN TRANSACTION;`);
+
+		const stmt = await db.prepare(`
+			INSERT OR REPLACE INTO transfers
+			(tx_hash, block_number, from_address, to_address, amount, gas_price, timestamp)
+			VALUES (?, ?, ?, ?, ?, ?, ?);
+			`);
+
+			for (const event of enriched) {
+				if (event.gasPrice) {
+					await stmt.run(
+						event.txHash,
+						event.blockNumber.toString(),
+						event.from.toLowerCase(),
+						event.to.toLowerCase(),
+						event.amount.toString(),
+						event.gasPrice.toString(),
+						event.timeStamp
+					);
+				}
+			}
+		
+		await stmt.finalize();
+		await db.exec(`COMMIT;`);
+
+		console.log(`Transfers saved to ${DB_PATH}`);
+	} catch (error) {
+		console.error('Database error:', error);
+		await db.exec(`ROLLBACK;`);
+	} finally {
+		await db.close();
 	}
-
-	const sortedEvents = enriched
-		.filter(e => e.gasPrice !== null)
-		.sort((a, b) => new Date(a.timeStamp).getTime() - new Date(b.timeStamp).getTime());
-
-	const gasStats = calculateGasStats(sortedEvents);
-
-	const finalOutput = {
-		events: sortedEvents.map(({ date, ...rest }) => rest),
-		gasStats
-	}
-
-	const safeStringify = (obj: any) => JSON.stringify(obj, (_, val) => (typeof val === 'bigint' ? val.toString() : val), 2);
-
-	await writeFile(`${OUTPUT_FILE}.json`, safeStringify(finalOutput));
-	console.log(`Transfers saved to ${OUTPUT_FILE}.json`);
 }
 
 main().catch(console.error);

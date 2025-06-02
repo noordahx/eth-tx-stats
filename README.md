@@ -35,15 +35,18 @@
 
 ```sh
 npm install
-# fill .env values
-npm start
+# write .env values
+# fill database with data
+npm run fill
+# export to json format with additional gasStats query results
+npm run export
 ```
 
 
 ### tech stack:
 
 * TS
-* viem (get tx data)
-* ethersacn api (get a list of tx hashes)
+* viem
 * ts-node-dev
 * dotenv
+* sqlite
